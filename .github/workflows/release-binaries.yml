@@ -1,0 +1,100 @@
+name: Release KeySlip MCPB binaries
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact version exposed by keyslip.app/downloads/server.json
+        type: string
+        required: true
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download and verify current public website artifacts
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re, urllib.request
+
+          version = os.environ['RELEASE_VERSION']
+          if not re.fullmatch(r'\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?', version):
+              raise SystemExit('Provide an exact semantic version such as 1.3.1.')
+          base = 'https://keyslip.app/downloads/'
+          with urllib.request.urlopen(base + 'server.json', timeout=30) as response:
+              server_bytes = response.read(128 * 1024 + 1)
+          if len(server_bytes) > 128 * 1024:
+              raise SystemExit('server.json is unexpectedly large.')
+          server = json.loads(server_bytes)
+          if server.get('name') != 'app.keyslip/keyslip' or server.get('version') != version:
+              raise SystemExit('Requested version does not match the currently deployed server.json.')
+          expected = {
+              'keyslip-linux-x64.mcpb', 'keyslip-linux-arm64.mcpb',
+              'keyslip-osx-x64.mcpb', 'keyslip-osx-arm64.mcpb',
+              'keyslip-win-x64.mcpb', 'keyslip-win-arm64.mcpb',
+          }
+          packages = server.get('packages')
+          if not isinstance(packages, list) or len(packages) != 6:
+              raise SystemExit('server.json must contain the six supported MCPB packages.')
+          checksums_url = base + 'MCP-SHA256SUMS'
+          with urllib.request.urlopen(checksums_url, timeout=30) as response:
+              sum_bytes = response.read(16 * 1024 + 1)
+          if len(sum_bytes) > 16 * 1024:
+              raise SystemExit('MCP-SHA256SUMS is unexpectedly large.')
+          checksum_rows = {}
+          for line in sum_bytes.decode('ascii').splitlines():
+              fields = line.split()
+              if len(fields) != 2 or not re.fullmatch(r'[a-f0-9]{64}', fields[0]):
+                  raise SystemExit('MCP-SHA256SUMS has an invalid row.')
+              checksum_rows[fields[1]] = fields[0]
+          if set(checksum_rows) != expected:
+              raise SystemExit('MCP-SHA256SUMS does not list exactly the six expected bundles.')
+          out = pathlib.Path('release-files')
+          out.mkdir(exist_ok=False)
+          seen = set()
+          for package in packages:
+              if package.get('registryType') != 'mcpb' or package.get('transport', {}).get('type') != 'stdio':
+                  raise SystemExit('Unexpected package type or transport.')
+              url = package.get('identifier', '')
+              match = re.fullmatch(r'https://github\.com/dobrician/keyslip-distribution/releases/download/v' + re.escape(version) + r'/(keyslip-[a-z0-9-]+\.mcpb)', url)
+              if not match:
+                  raise SystemExit('Package identifier does not point at the exact versioned distribution release.')
+              filename = match.group(1)
+              if filename not in expected or filename in seen:
+                  raise SystemExit('server.json contains an unexpected or repeated MCPB filename.')
+              seen.add(filename)
+              digest = package.get('fileSha256')
+              if not isinstance(digest, str) or not re.fullmatch(r'[a-f0-9]{64}', digest) or checksum_rows[filename] != digest:
+                  raise SystemExit(f'Checksum metadata mismatch for {filename}.')
+              with urllib.request.urlopen(base + filename, timeout=60) as response:
+                  data = response.read(100 * 1024 * 1024 + 1)
+              if len(data) > 100 * 1024 * 1024 or hashlib.sha256(data).hexdigest() != digest:
+                  raise SystemExit(f'Downloaded artifact hash mismatch for {filename}.')
+              (out / filename).write_bytes(data)
+          if seen != expected:
+              raise SystemExit('Not all expected bundles were downloaded.')
+          (out / 'SHA256SUMS').write_bytes(sum_bytes)
+          (out / 'server.json').write_bytes(server_bytes)
+          print(f'Verified six public KeySlip MCPB bundles for {version}.')
+          PY
+      - name: Create immutable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          if gh release view "v$RELEASE_VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release v$RELEASE_VERSION already exists; refusing to replace assets." >&2
+            exit 1
+          fi
+          cat > "$RUNNER_TEMP/release-notes.md" <<EOF_NOTES
+          KeySlip v$RELEASE_VERSION binary-only MCPB release.
+
+          Includes six OS/architecture bundles, matching Registry metadata, and SHA-256 checksums. The KeySlip source repository remains private. See the README for proprietary binary distribution terms.
+          EOF_NOTES
+          gh release create "v$RELEASE_VERSION" release-files/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "KeySlip MCPB v$RELEASE_VERSION" \
+            --notes-file "$RUNNER_TEMP/release-notes.md"
